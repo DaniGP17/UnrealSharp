@@ -42,11 +42,17 @@ jobs:
           git remote add origin https://github.com/$GITHUB_REPOSITORY.git
           git pull origin $GITHUB_REF:PR_BRANCH --depth=1
         
+      - name: Print UNREAL_TOKEN
+        shell: pwsh
+        run: echo ${{ secrets.UNREAL_TOKEN }}
       - name: Clone Unreal Engine
         shell: pwsh
         run: |
           cd C:/
           git clone https://${{ secrets.UNREAL_TOKEN }}@github.com/EpicGames/UnrealEngine.git --depth 1 --branch 5.0.3-release
+          
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v1.1
 
       - name: Dependencies
         shell: bash
