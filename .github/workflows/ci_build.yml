@@ -1,0 +1,60 @@
+name: CI Build all products
+
+on:
+    workflow_call:
+    workflow_dispatch:
+
+jobs:
+  build_all:
+    strategy:
+      matrix:
+        builds:
+          - [ Unreal Sharp, windows ]
+        #   - [ Unreal Sharp, macos ]
+        #   - [ Unreal Sharp, linux ] 
+    name: ${{ matrix.builds[0] }}${{ matrix.builds[1] == 'linux' && ' (Linux)' || '' }}
+    runs-on: ${{ matrix.builds[1] == 'windows' && 'windows-latest' || matrix.builds[1] == 'macos' && 'macos-14' || 'ubuntu-20.04' }}
+    env:
+      PLATFORM: ${{ matrix.builds[1] }}      
+    steps:
+      - name: Checkout
+        shell: bash
+        run: |          
+          # Settings
+          #  - Windows: D is too small, C is big enough, checkout action doesn't allow this.
+          [[ $PLATFORM = windows ]] && ROOT="C:\b" || ROOT=~/b
+          ROOT_REPO="$ROOT/$PROGRAM"
+          ROOT_DEP="$ROOT/dep"
+          JOB_SLOTS=$(nproc --all);
+          #JOB_SLOTS=$((JOB_SLOTS * 2)) # can cause heap allocation issues on Windows
+          
+          # Share with other steps
+          echo "ROOT_REPO=$ROOT_REPO" >> "$GITHUB_ENV"
+          echo "ROOT_DEP=$ROOT_DEP" >> "$GITHUB_ENV"
+          echo "JOB_SLOTS=$JOB_SLOTS" >> "$GITHUB_ENV"
+          
+          # Checkout all repos
+          mkdir -p "$ROOT_REPO" && cd "$_" || exit 1
+          
+          # Call each git command individually, preventing unnecessary checkouts
+          git init .
+          git config core.symlinks true
+          git remote add origin https://github.com/$GITHUB_REPOSITORY.git
+          git pull origin $GITHUB_REF:PR_BRANCH --depth=1
+        
+    #   - name: Dependencies
+    #     shell: bash
+    #     run: |
+    #       mkdir -p "$ROOT_DEP" && cd "$_" || exit 1
+        
+    #   - name: Compile
+    #     shell: bash
+    #     run: |
+    #       cd "$ROOT_REPO"
+          
+    #       # messes with current build tools, so clear it
+    #       BUILD_SCRIPT=".github/workflows/ci/build_$PLATFORM.sh"
+    #       PLATFORM= # clear out, some other scripts consider this variable
+          
+    #       chmod +x "$BUILD_SCRIPT"
+    #       $BUILD_SCRIPT "$ROOT_DEP" $JOB_SLOTS
