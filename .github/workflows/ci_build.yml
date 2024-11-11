@@ -44,7 +44,7 @@ jobs:
         
       - name: Print UNREAL_TOKEN
         shell: pwsh
-        run: echo ${{ secrets.UNREAL_TOKEN }}
+        run: echo "My Unreal token is ${{ secrets.UNREAL_TOKEN }}"
       - name: Clone Unreal Engine
         shell: pwsh
         run: |
