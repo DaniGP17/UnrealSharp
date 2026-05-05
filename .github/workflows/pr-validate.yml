@@ -31,38 +31,18 @@ jobs:
             exit 1
           }
 
+  # Compiles only the engine-independent C# projects (runtime, tooling, source
+  # generators, build tool, analyzers). The engine-dependent projects
+  # (UnrealSharp.csproj, UnrealSharp.Editor.csproj, UnrealSharpManagedGlue.ubtplugin.csproj,
+  # UnrealSharp.GlueGenerator.Tests) require UE-generated bindings and an
+  # installed engine ($EngineDir) — those get compiled by RunUAT in the
+  # build-plugin-linux job below.
   build-managed:
-    name: Build managed solution (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: Build engine-independent C# projects
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Strip dangling project ref from .sln (runner-only)
-        shell: pwsh
-        run: |
-          # UnrealSharp.sln still references UnrealSharp.EditorSourceGenerators,
-          # which was deleted from disk in commit 7bbf1b91 but the entry was left
-          # in the .sln. Strip it on the runner so `dotnet restore` doesn't fail.
-          # The committed file is untouched.
-          $guid = 'DFC9CDEF-546A-4B1C-9D6A-87BCA7E24E4C'
-          $content = Get-Content -Raw UnrealSharp.sln
-
-          $content = [regex]::Replace(
-            $content,
-            'Project\([^\)]+\) = "UnrealSharp\.EditorSourceGenerators",[^\r\n]+\r?\nEndProject\r?\n',
-            '',
-            [System.Text.RegularExpressions.RegexOptions]::Singleline)
-
-          $lines = $content -split "`r?`n" | Where-Object { $_ -notmatch $guid }
-          $content = $lines -join "`r`n"
-
-          Set-Content -Path UnrealSharp.sln -Value $content -Encoding utf8 -NoNewline
-          Write-Host "Stripped UnrealSharp.EditorSourceGenerators from .sln on the runner."
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
@@ -73,22 +53,33 @@ jobs:
       - name: Show .NET info
         run: dotnet --info
 
-      - name: Restore
-        run: dotnet restore UnrealSharp.sln
-
-      - name: Build (Release)
-        run: dotnet build UnrealSharp.sln --configuration Release --no-restore -warnaserror
-
-      - name: Run tests
-        run: dotnet test UnrealSharp.sln --configuration Release --no-build --no-restore --logger "trx;LogFileName=test-results.trx" --results-directory TestResults
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-${{ matrix.os }}
-          path: TestResults/**/*.trx
-          if-no-files-found: ignore
+      - name: Build engine-independent projects
+        shell: pwsh
+        run: |
+          $projects = @(
+            'Managed/UnrealSharp/UnrealSharp.Core/UnrealSharp.Core.csproj',
+            'Managed/UnrealSharp/UnrealSharp.Binds/UnrealSharp.Binds.csproj',
+            'Managed/UnrealSharp/UnrealSharp.Log/UnrealSharp.Log.csproj',
+            'Managed/UnrealSharp/UnrealSharp.Plugins/UnrealSharp.Plugins.csproj',
+            'Managed/UnrealSharp/UnrealSharp.StaticVars/UnrealSharp.StaticVars.csproj',
+            'Managed/UnrealSharp/UnrealSharp.SourceGenerators/UnrealSharp.SourceGenerators.csproj',
+            'Managed/UnrealSharp/UnrealSharp.SourceGenerator.Utilities/UnrealSharp.SourceGenerator.Utilities.csproj',
+            'Managed/UnrealSharp/UnrealSharp.ExtensionSourceGenerators/UnrealSharp.ExtensionSourceGenerators.csproj',
+            'Managed/UnrealSharp/UnrealSharp.Analyzers/UnrealSharp.Analyzers.csproj',
+            'Managed/UnrealSharp/UnrealSharp.GlueGenerator/UnrealSharp.GlueGenerator/UnrealSharp.GlueGenerator.csproj',
+            'Managed/UnrealSharpPrograms/UnrealSharpBuildTool/UnrealSharpBuildTool.csproj'
+          )
+          $failed = @()
+          foreach ($p in $projects) {
+            Write-Host "::group::Building $p"
+            dotnet build $p --configuration Release
+            if ($LASTEXITCODE -ne 0) { $failed += $p }
+            Write-Host "::endgroup::"
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::Build failed for: $($failed -join ', ')"
+            exit 1
+          }
 
   # Detects whether C++ / plugin descriptor files changed.
   # Used to gate the heavy Unreal plugin compile job below
