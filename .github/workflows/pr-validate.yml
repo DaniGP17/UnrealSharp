@@ -1,0 +1,190 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-uplugin:
+    name: Validate .uplugin descriptor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse UnrealSharp.uplugin as JSON
+        shell: pwsh
+        run: |
+          try {
+            $plugin = Get-Content -Raw UnrealSharp.uplugin | ConvertFrom-Json
+            Write-Host "OK: UnrealSharp.uplugin is valid JSON"
+            Write-Host "  FriendlyName : $($plugin.FriendlyName)"
+            Write-Host "  VersionName  : $($plugin.VersionName)"
+            Write-Host "  Modules      : $($plugin.Modules.Count)"
+          } catch {
+            Write-Error "UnrealSharp.uplugin is not valid JSON: $_"
+            exit 1
+          }
+
+  build-managed:
+    name: Build managed solution (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: Managed/global.json
+          dotnet-quality: preview
+
+      - name: Show .NET info
+        run: dotnet --info
+
+      - name: Restore
+        run: dotnet restore UnrealSharp.sln
+
+      - name: Build (Release)
+        run: dotnet build UnrealSharp.sln --configuration Release --no-restore -warnaserror
+
+      - name: Run tests
+        run: dotnet test UnrealSharp.sln --configuration Release --no-build --no-restore --logger "trx;LogFileName=test-results.trx" --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: TestResults/**/*.trx
+          if-no-files-found: ignore
+
+  # Detects whether C++ / plugin descriptor files changed.
+  # Used to gate the heavy Unreal plugin compile job below
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      cpp: ${{ steps.filter.outputs.cpp }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            cpp:
+              - 'Source/**'
+              - 'UnrealSharp.uplugin'
+              - 'UnrealSharp.AOT.props'
+              - 'UnrealSharp.GeneratedFiles.props'
+              - 'UnrealSharp.Shared.props'
+              - 'Config/**'
+              - '.github/workflows/pr-validate.yml'
+
+  # Compiles the C++ side of the plugin against UE 5.6 inside the official
+  # Epic dev-slim container. The image is cached privately on Cloudflare R2
+  # so we don't have to pull ~30 GB from ghcr each run.
+  build-plugin-linux:
+    name: Build Unreal plugin (Linux, UE 5.6)
+    needs: [validate-uplugin, build-managed, changes]
+    if: |
+      needs.changes.outputs.cpp == 'true'
+      && (github.event_name == 'push'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    continue-on-error: true # non-blocking until proven stable
+    timeout-minutes: 90
+
+    env:
+      UE_TAG: dev-slim-5.6.0
+      UE_IMAGE: ghcr.io/epicgames/unreal-engine:dev-slim-5.6.0
+      CACHE_FILE: ue-dev-slim-5.6.0.tar.zst
+
+    steps:
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Install zstd and AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          # awscli is preinstalled on ubuntu-latest, just verify
+          aws --version
+
+      - name: Download UE image from Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    auto
+        run: |
+          set -euo pipefail
+          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          echo "Downloading $CACHE_FILE from R2..."
+          aws s3 cp \
+            --endpoint-url "$ENDPOINT" \
+            "s3://${{ secrets.R2_BUCKET }}/$CACHE_FILE" \
+            "$CACHE_FILE"
+          ls -lh "$CACHE_FILE"
+
+      - name: Decompress and load Docker image
+        run: |
+          set -euo pipefail
+          echo "Decompressing $CACHE_FILE..."
+          zstd -d "$CACHE_FILE" -o ue-image.tar
+          rm -f "$CACHE_FILE"
+
+          echo "Loading image into Docker..."
+          docker load -i ue-image.tar
+          rm -f ue-image.tar
+
+          docker image ls "$UE_IMAGE"
+
+      - name: Run RunUAT BuildPlugin
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/PluginBuild"
+
+          # Make the workspace writable by the ue4 user inside the container.
+          # The dev-slim image runs as uid 1000 (ue4) by default, which usually
+          # matches the GitHub runner user, but we chmod to be safe.
+          sudo chown -R 1000:1000 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/PluginBuild"
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$RUNNER_TEMP/PluginBuild:/output" \
+            -w /workspace \
+            "$UE_IMAGE" \
+            /home/ue4/UnrealEngine/Engine/Build/BatchFiles/RunUAT.sh \
+              BuildPlugin \
+              -Plugin=/workspace/UnrealSharp.uplugin \
+              -Package=/output \
+              -TargetPlatforms=Linux \
+              -Rocket
+
+      - name: Upload built plugin
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: UnrealSharp-plugin-linux-ue5.6
+          path: ${{ runner.temp }}/PluginBuild
+          if-no-files-found: error
+          retention-days: 7
